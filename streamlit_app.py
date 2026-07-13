@@ -69,6 +69,18 @@ st.markdown("""
 
 
 # ============================================================================
+# FIXED RL HYPERPARAMETERS
+# ============================================================================
+# Tuned via sweep across fairness_weight x miss_penalty (see project notes).
+# fairness_weight=2.0 gave the best latency AND best fairness among all
+# tested RL configs; miss_penalty=25.0 was the best-performing pairing with
+# it. No longer exposed as sliders since these are settled values, not
+# something a user should need to retune per-session.
+RL_FAIRNESS_WEIGHT = 2.0
+RL_MISS_PENALTY = 25.0
+
+
+# ============================================================================
 # SIDEBAR CONFIGURATION
 # ============================================================================
 
@@ -76,7 +88,7 @@ st.sidebar.markdown("## ⚙️ Configuration")
 
 mode = st.sidebar.radio(
     "Select Mode",
-    ["🎯 Single Policy", "📊 Policy Comparison", "🤖 RL Agent"],
+    ["🎯 Single Policy", "📊 Policy Comparison", "🤖 RL Agent", "🔁 Multi-Run Average"],
     label_visibility="collapsed"
 )
 
@@ -114,34 +126,39 @@ def create_metric_card(label: str, value: str, suffix: str = ""):
     """
 
 
+METRIC_DEFS = {
+    "miss_rate": ("Miss Rate", "%"),
+    "mean_latency": ("Mean Latency", "s"),
+    "throughput": ("Throughput", "T/s"),
+    "fairness": ("Fairness", "Jain's Index"),
+    "utilization": ("Utilization", "%"),
+}
+
+POLICY_COLORS = {
+    "RoundRobin": "#aec7e8", "EDF": "#ffbb78", "WeightedLeastLoaded": "#98df8a",
+    "ShortestJobFirst": "#ff9896", "HybridScheduler": "#c5b0d5", "RL-Agent": "#d62728",
+    "LeastLoaded": "#c49c94", "WeightedLeastConnection": "#f7b6d2",
+    "DeadlineAwareFastestNode": "#dbdb8d", "MostIdleNode": "#9edae5",
+}
+
+
 def plot_metrics_comparison(all_results: Dict, regimes: List[str]):
-    metrics = {
-        "miss_rate": ("Miss Rate", "%"),
-        "mean_latency": ("Mean Latency", "s"),
-        "throughput": ("Throughput", "T/s"),
-        "fairness": ("Fairness", "Jain's Index"),
-        "utilization": ("Utilization", "%"),
-    }
     fig = make_subplots(
         rows=2, cols=3,
-        subplot_titles=[f"<b>{title}</b>" for title, _ in metrics.values()],
+        subplot_titles=[f"<b>{title}</b>" for title, _ in METRIC_DEFS.values()],
         specs=[[{"type": "bar"}, {"type": "bar"}, {"type": "bar"}],
                [{"type": "bar"}, {"type": "bar"}, None]]
     )
-    colors = {
-        "RoundRobin": "#aec7e8", "EDF": "#ffbb78", "WeightedLeastLoaded": "#98df8a",
-        "ShortestJobFirst": "#ff9896", "HybridScheduler": "#c5b0d5", "RL-Agent": "#d62728",
-    }
     policy_names = list(all_results.keys())
-    for metric_key, (metric_title, suffix) in list(metrics.items())[:5]:
-        row = (list(metrics.keys()).index(metric_key) // 3) + 1
-        col = (list(metrics.keys()).index(metric_key) % 3) + 1
+    for idx, (metric_key, (metric_title, suffix)) in enumerate(METRIC_DEFS.items()):
+        row = (idx // 3) + 1
+        col = (idx % 3) + 1
         for policy in policy_names:
             values = [all_results[policy][regime].to_dict()[metric_key] for regime in regimes]
             fig.add_trace(
                 go.Bar(
                     x=regimes, y=values, name=policy,
-                    marker_color=colors.get(policy, "#cccccc"),
+                    marker_color=POLICY_COLORS.get(policy, "#cccccc"),
                     showlegend=(row == 1 and col == 1),
                     hovertemplate=f"<b>{policy}</b><br>" + f"{metric_title}: %{{y:.2f}}{suffix}<extra></extra>"
                 ),
@@ -149,6 +166,49 @@ def plot_metrics_comparison(all_results: Dict, regimes: List[str]):
             )
     fig.update_layout(
         title_text="<b>Comprehensive Policy Comparison</b>", title_font_size=18, title_x=0.5,
+        showlegend=True,
+        legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=0.75),
+        height=700, template="plotly_dark", hovermode="x unified"
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.2)")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.2)")
+    return fig
+
+
+def plot_metrics_comparison_avg(avg_results: Dict, std_results: Dict, regimes: List[str], n_runs: int):
+    """
+    Same 5-panel layout as plot_metrics_comparison, but built from pre-averaged
+    plain-dict metrics (avg_results[policy][regime][metric_key] -> float) with
+    optional std-dev error bars (std_results, same shape). Used by the
+    Multi-Run Average tab where results are already aggregated across seeds
+    rather than being single SimulationResult objects.
+    """
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=[f"<b>{title}</b>" for title, _ in METRIC_DEFS.values()],
+        specs=[[{"type": "bar"}, {"type": "bar"}, {"type": "bar"}],
+               [{"type": "bar"}, {"type": "bar"}, None]]
+    )
+    policy_names = list(avg_results.keys())
+    for idx, (metric_key, (metric_title, suffix)) in enumerate(METRIC_DEFS.items()):
+        row = (idx // 3) + 1
+        col = (idx % 3) + 1
+        for policy in policy_names:
+            values = [avg_results[policy][regime][metric_key] for regime in regimes]
+            errors = [std_results[policy][regime][metric_key] for regime in regimes]
+            fig.add_trace(
+                go.Bar(
+                    x=regimes, y=values, name=policy,
+                    marker_color=POLICY_COLORS.get(policy, "#cccccc"),
+                    showlegend=(row == 1 and col == 1),
+                    error_y=dict(type="data", array=errors, visible=True, thickness=1, width=3),
+                    hovertemplate=f"<b>{policy}</b><br>" + f"{metric_title}: %{{y:.2f}}{suffix} (±std)<extra></extra>"
+                ),
+                row=row, col=col
+            )
+    fig.update_layout(
+        title_text=f"<b>Multi-Run Average Comparison (n={n_runs} runs/regime)</b>",
+        title_font_size=18, title_x=0.5,
         showlegend=True,
         legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=0.75),
         height=700, template="plotly_dark", hovermode="x unified"
@@ -343,14 +403,7 @@ elif mode == "🤖 RL Agent":
     st.markdown("---")
 
     st.markdown("### Training RL Agent — Imitation Warm-Start + REINFORCE Fine-Tuning")
-    st.info(
-        "**Phase 1 (imitation):** the agent clones the EDF-exact teacher's per-task node choice. "
-        "**Phase 2 (REINFORCE):** it then fine-tunes directly on the real simulator using a reward "
-        "that penalizes latency, deadline misses, *and* load imbalance across the whole episode — "
-        "a signal no single-task greedy formula (EDF/SJF/Hybrid all reduce to the same 'soonest "
-        "finish' ranking) can represent. This is how the RL agent can beat those baselines, "
-        "typically trading some fairness for lower miss-rate under tight deadlines (HEAVY regime)."
-    )
+
 
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
@@ -363,18 +416,11 @@ elif mode == "🤖 RL Agent":
             default=["EDF", "WeightedLeastLoaded"]
         )
 
-    col4, col5 = st.columns(2)
-    with col4:
-        fairness_weight = st.slider(
-            "Fairness penalty weight", min_value=0.0, max_value=5.0, value=1.0, step=0.25,
-            help="Higher = agent sacrifices more latency/miss-rate to spread load evenly. "
-                 "Lower = agent chases latency/miss-rate more aggressively, like the greedy baselines."
-        )
-    with col5:
-        miss_penalty = st.slider(
-            "Deadline-miss penalty weight", min_value=0.0, max_value=100.0, value=25.0, step=5.0,
-            help="How harshly a missed deadline is punished relative to raw latency."
-        )
+    st.caption(
+        f"Fairness penalty weight and deadline-miss penalty weight are fixed at "
+        f"**{RL_FAIRNESS_WEIGHT}** and **{RL_MISS_PENALTY}** respectively — tuned via sweep, "
+        f"no longer exposed as sliders."
+    )
 
     if st.button("▶ Train Agent & Evaluate", key="rl_train", type="primary"):
         progress_bar = st.progress(0)
@@ -394,7 +440,7 @@ elif mode == "🤖 RL Agent":
         with st.spinner("RL training in progress..."):
             agent.train_rl(
                 train_env, episodes=n_rl, verbose=False, tasks_per_episode=150,
-                lr=5e-5, fairness_weight=fairness_weight, miss_penalty=miss_penalty
+                lr=5e-5, fairness_weight=RL_FAIRNESS_WEIGHT, miss_penalty=RL_MISS_PENALTY
             )
         progress_bar.progress(75)
 
@@ -450,6 +496,112 @@ elif mode == "🤖 RL Agent":
 
         progress_bar.progress(100)
         status_text.text("✅ Agent training and evaluation complete!")
+
+
+# ============================================================================
+# MODE: MULTI-RUN AVERAGE
+# ============================================================================
+
+elif mode == "🔁 Multi-Run Average":
+    st.markdown("---")
+    st.markdown("### Multi-Run Average Comparison")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        avg_policies = st.multiselect(
+            "Select Policies to Compare", list(POLICIES.keys()) + ["RL-Agent"],
+            default=["RoundRobin", "EDF", "WeightedLeastLoaded", "RL-Agent"],
+            help="Include RL-Agent to train it once, then evaluate it across all the runs below."
+        )
+    with col2:
+        avg_regimes = st.multiselect("Load Regimes", ["LIGHT", "MIXED", "HEAVY"],
+                                      default=["LIGHT", "MIXED", "HEAVY"], key="avg_regimes")
+
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        n_runs = st.slider("Number of Runs to Average", min_value=3, max_value=30, value=10, step=1)
+    with col4:
+        base_seed = st.number_input("Base Seed (run i uses base_seed + i)", value=1000, min_value=0)
+    with col5:
+        if "RL-Agent" in avg_policies:
+            rl_episodes = st.slider("RL Train Episodes (pretrain + RL, each)", min_value=50, max_value=800,
+                                     value=300, step=50)
+        else:
+            rl_episodes = None
+
+    if st.button("▶ Run Multi-Run Comparison", key="avg_run", type="primary"):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        run_seeds = [int(base_seed) + i for i in range(n_runs)]
+
+        # Train the RL agent once (if selected), on the sidebar's configured
+        # training seed — separate from run_seeds so evaluation stays
+        # held-out, matching how train_rl's own internal checkpointing works.
+        agent = None
+        if "RL-Agent" in avg_policies:
+            status_text.text("🤖 Training RL agent once (shared across all runs)...")
+            train_env = Environment(n_nodes=n_nodes, seed=seed)
+            agent = SchedulerAgent(n_nodes, lr=1e-3)
+            agent.pretrain(train_env, episodes=rl_episodes, verbose=False, tasks_per_episode=150)
+            agent.train_rl(
+                train_env, episodes=rl_episodes, verbose=False, tasks_per_episode=150,
+                lr=5e-5, fairness_weight=RL_FAIRNESS_WEIGHT, miss_penalty=RL_MISS_PENALTY
+            )
+        progress_bar.progress(15)
+
+        # raw_metrics[policy][regime][metric_key] -> list of per-run values
+        raw_metrics = {p: {r: {m: [] for m in METRIC_DEFS} for r in avg_regimes} for p in avg_policies}
+
+        total_steps = len(avg_policies) * len(avg_regimes) * n_runs
+        step = 0
+        for policy_name in avg_policies:
+            for regime in avg_regimes:
+                for run_seed in run_seeds:
+                    status_text.text(f"Running {policy_name} — {regime} — seed {run_seed}...")
+                    run_env = Environment(n_nodes=n_nodes, seed=run_seed)
+                    if policy_name == "RL-Agent":
+                        policy = agent.as_policy(run_env.nodes)
+                    else:
+                        policy = instantiate_policy(policy_name, run_env.nodes)
+                    tasks = run_env.generate_tasks(n_tasks, regime=regime)
+                    result = SimulationEngine.evaluate(policy, run_env, tasks, verbose=False)
+                    result_dict = result.to_dict()
+                    for m in METRIC_DEFS:
+                        raw_metrics[policy_name][regime][m].append(result_dict[m])
+
+                    step += 1
+                    progress_bar.progress(15 + int(80 * step / total_steps))
+
+        # Aggregate mean + std across runs
+        avg_results = {p: {r: {} for r in avg_regimes} for p in avg_policies}
+        std_results = {p: {r: {} for r in avg_regimes} for p in avg_policies}
+        for policy_name in avg_policies:
+            for regime in avg_regimes:
+                for m in METRIC_DEFS:
+                    vals = raw_metrics[policy_name][regime][m]
+                    avg_results[policy_name][regime][m] = float(np.mean(vals))
+                    std_results[policy_name][regime][m] = float(np.std(vals))
+
+        status_text.text("📊 Creating visualizations...")
+        st.plotly_chart(
+            plot_metrics_comparison_avg(avg_results, std_results, avg_regimes, n_runs),
+            use_container_width=True
+        )
+
+        st.markdown("## Averaged Results Table (mean ± std across runs)")
+        table_rows = []
+        for policy_name in avg_policies:
+            for regime in avg_regimes:
+                row = {"Policy": policy_name, "Regime": regime, "Runs": n_runs}
+                for m, (title, suffix) in METRIC_DEFS.items():
+                    mean_v = avg_results[policy_name][regime][m]
+                    std_v = std_results[policy_name][regime][m]
+                    row[title] = f"{mean_v:.2f} ± {std_v:.2f}"
+                table_rows.append(row)
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+
+        progress_bar.progress(100)
+        status_text.text(f"✅ Multi-run comparison complete! ({n_runs} runs/policy/regime)")
 
 
 # ============================================================================
