@@ -54,7 +54,7 @@ edge-resource-allocation/
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/edge-resource-allocation.git
+git clone https://github.com/darsh-khanna/edge-resource-allocation.git
 cd edge-resource-allocation
 ```
 
