@@ -1,224 +1,132 @@
-"""
-Scheduling policies for task assignment to compute nodes.
-
-Each policy implements a different strategy for load balancing and deadline handling.
-"""
-
 from environment import Task, Node
 from typing import List
-import numpy as np
 
 
 class BasePolicy:
-    """Base class for all scheduling policies."""
-    
     def __init__(self, nodes: List[Node]):
         self.nodes = nodes
-    
     def select(self, task):
         raise NotImplementedError
-
     def uses_edf_queue(self) -> bool:
         return False
 
 
 class RoundRobin(BasePolicy):
-    """
-    Distributes tasks in cyclic order.
-    
-    ✓ Shines when: LIGHT regime, uniform task sizes
-    ✓ Zero overhead — no per-task scoring
-    ✓ Works well when load is balanced by nature
-    """
-    
-    def __init__(self, nodes: List[Node]):
+    def __init__(self, nodes):
         super().__init__(nodes)
         self.i = 0
-    
-    def select(self, task: Task) -> Node:
+    def select(self, task):
         node = self.nodes[self.i % len(self.nodes)]
         self.i += 1
         return node
 
 
 class LeastLoaded(BasePolicy):
-    """
-    Selects node with least work (queue depth weighted by speed).
-    
-    ✓ Shines when: LIGHT/MIXED regimes
-    ✓ Handles heterogeneous node speeds well
-    ✓ Does NOT include incoming task in estimate
-    """
-    
-    def select(self, task: Task) -> Node:
+    def select(self, task):
+        # workload()/load() are always 0 in this online sim (the queue drains
+        # the instant a task is pushed), so "current backlog" has to be read
+        # from how much longer the node is still busy: max(0, n.time - arrival).
+        # Deliberately excludes task.size (that's WeightedLeastLoaded's job).
         return min(
             self.nodes,
-            key=lambda n: n.workload() / max(n.base_speed, 1e-6)
+            key=lambda n: max(0.0, n.time - task.arrival) / max(n.base_speed, 1e-6)
         )
 
 
 class WeightedLeastLoaded(BasePolicy):
-    """
-    Selects node with earliest task completion (greedy).
-    
-    ✓ Classic greedy baseline
-    ✓ Includes incoming task in finish time estimate
-    ✓ Good for heterogeneous speeds and sizes
-    """
-    
-    def select(self, task: Task) -> Node:
-        return min(
-            self.nodes,
-            key=lambda n: max(n.time, task.arrival) + (task.size / max(n.base_speed, 1e-6))
-        )
+    def select(self, task):
+        return min(self.nodes, key=lambda n: max(n.time, task.arrival) + (task.size / max(n.base_speed, 1e-6)))
 
 
 class EDF(BasePolicy):
-    """
-    Earliest Deadline First scheduling policy.
-    
-    ✓ Shines when: MIXED/HEAVY regimes with varied deadlines
-    ✓ Routes to nodes that give maximum slack (deadline feasibility)
-    ✓ Penalizes infeasible nodes to avoid cascading misses
-    ✓ Uses EDF execution queue on nodes
-    """
-    
-    def uses_edf_queue(self) -> bool:
+    def uses_edf_queue(self):
         return True
-    
-    def select(self, task: Task) -> Node:
+    def select(self, task):
         def score(n):
             finish = n.estimated_finish(task)
             slack = task.deadline - (finish - task.arrival)
-            
             if slack >= 0:
-                return -slack  # Feasible: maximize slack
-            return 1000.0 + abs(slack)  # Infeasible: penalize
-        
+                return -slack
+            return 1000.0 + abs(slack)
         return min(self.nodes, key=score)
 
 
 class ShortestJobFirst(BasePolicy):
-    """
-    Routes short tasks to nodes that complete them soonest.
-    
-    ✓ Shines when: MIXED regime with high size variance
-    ✓ Clears queue faster by prioritizing small tasks
-    ✓ Includes task.size in completion estimate (unlike LeastLoaded)
-    """
-    
-    def select(self, task: Task) -> Node:
+    def select(self, task):
         return min(self.nodes, key=lambda n: n.estimated_finish(task))
 
 
 class WeightedLeastConnection(BasePolicy):
-    """
-    Distributes based on active connection count weighted by speed.
-    
-    ✓ Shines when: Node speeds differ significantly
-    ✓ Distributes task COUNT, not total work
-    ✓ Fast nodes get proportionally more tasks
-    """
-    
-    def select(self, task: Task) -> Node:
+    def select(self, task):
+        # n.load() (queue length) is always 0 for the same reason as above.
+        # "Connections" here has to mean cumulative tasks routed to this node
+        # so far, which total_tasks_processed tracks correctly (each push is
+        # processed synchronously, so it's an accurate running count).
         return min(
             self.nodes,
-            key=lambda n: (n.load() + 1) / max(n.base_speed, 1e-6)
+            key=lambda n: (n.metrics.total_tasks_processed + 1) / max(n.base_speed, 1e-6)
         )
 
 
 class DeadlineAwareFastestNode(BasePolicy):
-    """
-    EDF-aware scheduling with strong infeasibility penalty.
-    
-    ✓ Shines when: HEAVY regime with very tight deadlines
-    ✓ Uses EDF execution queue to prioritize urgent tasks
-    ✓ Applies stronger penalty to steer clear of hopeless nodes
-    """
-    
-    def uses_edf_queue(self) -> bool:
+    def uses_edf_queue(self):
         return True
-    
-    def select(self, task: Task) -> Node:
+    def select(self, task):
         best_node = None
         best_score = float('inf')
-        
         for n in self.nodes:
             finish = n.estimated_finish(task)
             slack = task.deadline - (finish - task.arrival)
-            
             if slack >= 0:
                 score = -slack
             else:
                 score = 2000.0 + abs(slack)
-            
             if score < best_score:
                 best_score = score
                 best_node = n
-        
         return best_node
 
 
 class HybridScheduler(BasePolicy):
-    """
-    Adaptive scheduling that changes strategy based on system load.
-    
-    ✓ Light load  → optimize latency (like SJF)
-    ✓ Medium load → balance latency + deadline feasibility
-    ✓ Heavy load  → strongly penalize infeasible assignments
-    ✓ Expected best all-rounder across regimes
-    """
-    
-    def select(self, task: Task) -> Node:
-        # Compute average system load
-        avg_load = sum(n.workload() for n in self.nodes) / max(len(self.nodes), 1)
-        
+    def select(self, task):
+        # sum(n.workload()) is always 0 in this online sim, so this branch
+        # never fired. Real congestion signal: average backlog time, i.e.
+        # how much longer each node is still busy right now.
+        # Thresholds calibrated against actual backlog distributions:
+        # LIGHT ~0.03, MIXED ~0.8, HEAVY ~50 (mean, seed=42, 200 tasks/node=8).
+        avg_load = sum(max(0.0, n.time - task.arrival) for n in self.nodes) / max(len(self.nodes), 1)
         def score(n):
             finish = n.estimated_finish(task)
             slack = task.deadline - (finish - task.arrival)
             miss_penalty = max(0.0, -slack)
-            
-            if avg_load < 3.0:
-                # Light: pure latency optimization
+            if avg_load < 0.5:
                 return finish
-            elif avg_load < 10.0:
-                # Medium: balance latency + deadline
+            elif avg_load < 8.0:
                 return finish + 3.0 * miss_penalty
             else:
-                # Heavy: heavily penalize deadline misses
                 return finish + 8.0 * miss_penalty
-        
         return min(self.nodes, key=score)
 
 
 class MostIdleNode(BasePolicy):
-    """
-    Simple strategy that picks the node with most idle capacity.
-    
-    ✓ Extreme opposite of LeastLoaded
-    ✓ Useful for comparison/baseline
-    """
-    
-    def select(self, task: Task) -> Node:
-        return max(self.nodes, key=lambda n: n.base_speed - (n.workload() / max(n.base_speed, 1e-6)))
+    def select(self, task):
+        # Mirror of the fixed LeastLoaded backlog signal, maximized instead
+        # of minimized, so this is a genuine opposite rather than a static
+        # "always pick the fastest node" fallback.
+        return max(
+            self.nodes,
+            key=lambda n: n.base_speed - (max(0.0, n.time - task.arrival) / max(n.base_speed, 1e-6))
+        )
 
 
-# Registry of all available policies
 POLICIES = {
-    "RoundRobin": RoundRobin,
-    "LeastLoaded": LeastLoaded,
-    "WeightedLeastLoaded": WeightedLeastLoaded,
-    "EDF": EDF,
-    "ShortestJobFirst": ShortestJobFirst,
-    "WeightedLeastConnection": WeightedLeastConnection,
-    "DeadlineAwareFastestNode": DeadlineAwareFastestNode,
-    "HybridScheduler": HybridScheduler,
+    "RoundRobin": RoundRobin, "LeastLoaded": LeastLoaded, "WeightedLeastLoaded": WeightedLeastLoaded,
+    "EDF": EDF, "ShortestJobFirst": ShortestJobFirst, "WeightedLeastConnection": WeightedLeastConnection,
+    "DeadlineAwareFastestNode": DeadlineAwareFastestNode, "HybridScheduler": HybridScheduler,
     "MostIdleNode": MostIdleNode,
 }
 
-
-def instantiate_policy(name: str, nodes: List[Node]) -> BasePolicy:
-    """Instantiate a policy by name."""
+def instantiate_policy(name, nodes):
     if name not in POLICIES:
-        raise ValueError(f"Unknown policy: {name}. Available: {list(POLICIES.keys())}")
+        raise ValueError(f"Unknown policy: {name}")
     return POLICIES[name](nodes)
